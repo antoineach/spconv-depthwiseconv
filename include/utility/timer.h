@@ -14,14 +14,14 @@
 
 #pragma once
 #include <chrono>
-#ifdef SPCONV_CUDA
+#ifdef TV_CUDA
 #include <cuda_runtime_api.h>
 #endif
 #include <iostream>
 
 namespace spconv {
 
-#ifdef SPCONV_CUDA
+#ifdef TV_CUDA
 template <typename TimeT = std::chrono::microseconds> struct CudaContextTimer {
   CudaContextTimer() {
     cudaDeviceSynchronize();
