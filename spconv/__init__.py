@@ -14,5 +14,5 @@
 
 from . import build as _build
 
-from .algo import ConvAlgo
-from . import utils, constants
+from .core import ConvAlgo, AlgoHint
+from . import constants
