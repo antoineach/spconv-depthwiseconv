@@ -18,3 +18,7 @@ if hasattr(_ext, "cumm"):
     CPU_ONLY_BUILD = False
 else:
     CPU_ONLY_BUILD = True
+
+from spconv.core_cc.csrc.utils.boxops import BoxOps
+
+HAS_BOOST = BoxOps.has_boost()
