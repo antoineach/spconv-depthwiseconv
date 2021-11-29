@@ -23,3 +23,6 @@ from spconv.core_cc.csrc.sparse.all import SpconvOps
 
 BUILD_CUMM_VERSION = SpconvOps.cumm_version()
 BUILD_PCCM_VERSION = SpconvOps.pccm_version()
+from spconv.core_cc.csrc.utils.boxops import BoxOps
+
+HAS_BOOST = BoxOps.has_boost()
