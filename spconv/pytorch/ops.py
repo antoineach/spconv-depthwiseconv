@@ -1497,53 +1497,38 @@ def indice_conv_depthwise(features: torch.Tensor,
                                    dtype=features.dtype,
                                    device=features.device)
 
-    # Flatten the whole rulebook into a single (input idx, output idx, kernel
-    # idx) triplet list so the heavy work is done with one gather, one
-    # per-pair weight gather, one multiply and one scatter-add instead of a
-    # python loop of small kernels (much lower launch overhead -> faster).
-    all_in, all_out, all_k = _flatten_depthwise_rulebook(
-        pair_in, pair_out, indice_pair_num_cpu, kv, kv_center, subm)
-    if all_in is not None:
-        gathered = features.index_select(0, all_in)
-        gathered = gathered * filters.index_select(0, all_k)
-        out_features.index_add_(0, all_out, gathered)
+    # Per kernel offset: gather -> multiply by the per-channel weight (a cheap
+    # [C] broadcast, no weight buffer) -> scatter-add. Small reused buffers
+    # keep this memory bound and cache friendly. ``filters[i]`` never
+    # materialises a [T, C] tensor, unlike a single flattened pass.
+    for i, nhot in _depthwise_offsets(indice_pair_num_cpu, kv, kv_center, subm):
+        in_inds = pair_in[i, :nhot].long()
+        out_inds = pair_out[i, :nhot].long()
+        gathered = features.index_select(0, in_inds)
+        gathered *= filters[i]
+        out_features.index_add_(0, out_inds, gathered)
 
     if bias is not None:
         out_features = out_features + bias
     return out_features
 
 
-def _flatten_depthwise_rulebook(pair_in, pair_out, indice_pair_num_cpu, kv,
-                                kv_center, subm):
-    """Concatenate all non-center kernel offsets into flat index tensors.
+def _depthwise_offsets(indice_pair_num_cpu, kv, kv_center, subm):
+    """Yield ``(i, nhot)`` for every kernel offset that has work to do.
 
-    Returns ``(all_in, all_out, all_k)`` int64 tensors, or ``(None, None,
-    None)`` when there is nothing to accumulate. ``all_k`` is the kernel offset
-    index of every pair, used to gather the matching per-channel weight.
-
-    For submanifold convolution spconv only fills ``indice_pair_num`` for the
-    lower half of the kernel; the upper half mirrors its counterpart. We
-    replicate the exact convention used by :func:`indice_conv`.
+    The center offset is skipped for submanifold convs (handled as an identity
+    map by the caller). For submanifold convs spconv only fills
+    ``indice_pair_num`` for the lower half of the kernel; the upper half
+    mirrors its counterpart, exactly as :func:`indice_conv` does.
     """
-    in_pieces: List[torch.Tensor] = []
-    out_pieces: List[torch.Tensor] = []
-    k_pieces: List[torch.Tensor] = []
-    device = pair_in.device
     for i, nhot in enumerate(indice_pair_num_cpu):
         if subm and i == kv_center:
             continue
         if subm and i > kv_center:
-            # mirror count: spconv stores the count only for i <= kv_center.
             nhot = indice_pair_num_cpu[kv - i - 1]
         if nhot <= 0:
             continue
-        in_pieces.append(pair_in[i, :nhot].long())
-        out_pieces.append(pair_out[i, :nhot].long())
-        k_pieces.append(
-            torch.full((nhot, ), i, dtype=torch.int64, device=device))
-    if not in_pieces:
-        return None, None, None
-    return (torch.cat(in_pieces), torch.cat(out_pieces), torch.cat(k_pieces))
+        yield i, nhot
 
 
 def indice_conv_depthwise_backward(features: torch.Tensor,
@@ -1577,17 +1562,15 @@ def indice_conv_depthwise_backward(features: torch.Tensor,
     else:
         grad_features = torch.zeros_like(features)
 
-    all_in, all_out, all_k = _flatten_depthwise_rulebook(
-        pair_in, pair_out, indice_pair_num_cpu, kv, kv_center, subm)
-    if all_in is not None:
-        in_gathered = features.index_select(0, all_in)
-        go_gathered = grad_output.index_select(0, all_out)
-        prod = in_gathered * go_gathered
-        # dL/dw[i] = sum over all pairs assigned to offset i of (in * grad_out)
-        grad_filters.index_add_(0, all_k, prod)
-        # dL/din at the gathered input points = grad_out * w[offset of pair]
-        grad_features.index_add_(0, all_in,
-                                 go_gathered * filters.index_select(0, all_k))
+    for i, nhot in _depthwise_offsets(indice_pair_num_cpu, kv, kv_center, subm):
+        in_inds = pair_in[i, :nhot].long()
+        out_inds = pair_out[i, :nhot].long()
+        in_gathered = features.index_select(0, in_inds)
+        go_gathered = grad_output.index_select(0, out_inds)
+        # dL/dw[i] = sum over matched pairs of (in * grad_out)
+        grad_filters[i] = (in_gathered * go_gathered).sum(0)
+        # dL/din at the gathered input points = grad_out * w[i]
+        grad_features.index_add_(0, in_inds, go_gathered * filters[i])
 
     return grad_features, grad_filters
 
