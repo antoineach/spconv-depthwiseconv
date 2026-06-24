@@ -182,18 +182,11 @@ def run_gradcheck(device="cuda"):
 # --------------------------------------------------------------------------- #
 #  Speed benchmark vs equivalent full conv                                    #
 # --------------------------------------------------------------------------- #
-def benchmark(device="cuda", channels=64, shape=(40, 40, 40),
-              num_points=30000, ks=3, iters=50):
+def benchmark(device="cuda", shape=(40, 40, 40), num_points=30000, ks=3,
+              iters=50):
     if device != "cuda":
         print("\n(skip benchmark: needs cuda)")
         return
-    print(f"\n=== benchmark C={channels} N={num_points} k={ks} ===")
-    feats, indices = make_data(device, torch.float32, channels, shape,
-                               num_points)
-    x = spconv.SparseConvTensor(feats, indices, list(shape), 1)
-    dw = spconv.SubMConvDepthwise3d(channels, ks, padding=1, bias=False).to(device)
-    full = spconv.SubMConv3d(channels, channels, ks, padding=1, bias=False,
-                             algo=ConvAlgo.Native, indice_key="k").to(device)
 
     def bench(fn):
         for _ in range(5):
@@ -205,11 +198,42 @@ def benchmark(device="cuda", channels=64, shape=(40, 40, 40),
         torch.cuda.synchronize()
         return (time.time() - t) / iters * 1e3
 
-    t_dw = bench(lambda: dw(x))
-    t_full = bench(lambda: full(x))
-    print(f"  depthwise:        {t_dw:.3f} ms/iter")
-    print(f"  full conv (CxC):  {t_full:.3f} ms/iter")
-    print(f"  speed-up:         {t_full / t_dw:.1f}x")
+    print(f"\n=== benchmark (subm, N={num_points}, k={ks}) ===")
+    print(f"  {'C':>5} | {'depthwise':>10} | {'full CxC':>10} | "
+          f"{'emulated':>10} | {'vs full':>7} | {'vs emul':>7}")
+    print("  " + "-" * 66)
+    for channels in (16, 32, 64, 128):
+        feats, indices = make_data(device, torch.float32, channels, shape,
+                                   num_points)
+        x = spconv.SparseConvTensor(feats, indices, list(shape), 1)
+        dw = spconv.SubMConvDepthwise3d(channels, ks, padding=1,
+                                        bias=False).to(device)
+        full = spconv.SubMConv3d(channels, channels, ks, padding=1, bias=False,
+                                 algo=ConvAlgo.Native, indice_key="k").to(device)
+        # "emulated": depthwise via C independent 1-channel submanifold convs,
+        # the only way to do depthwise on stock spconv today.
+        emul = [spconv.SubMConv3d(1, 1, ks, padding=1, bias=False,
+                                  algo=ConvAlgo.Native,
+                                  indice_key="e").to(device)
+                for _ in range(channels)]
+
+        def run_emul():
+            outs = []
+            for c, layer in enumerate(emul):
+                xc = spconv.SparseConvTensor(feats[:, c:c + 1], indices,
+                                             list(shape), 1)
+                outs.append(layer(xc).features)
+            return torch.cat(outs, dim=1)
+
+        t_dw = bench(lambda: dw(x))
+        t_full = bench(lambda: full(x))
+        t_emul = bench(run_emul)
+        print(f"  {channels:>5} | {t_dw:>8.3f}ms | {t_full:>8.3f}ms | "
+              f"{t_emul:>8.3f}ms | {t_full / t_dw:>6.1f}x | "
+              f"{t_emul / t_dw:>6.1f}x")
+    print("  (depthwise uses C x fewer FLOPs/params than full CxC conv; both\n"
+          "   are memory bound so latency is similar, but depthwise is far\n"
+          "   cheaper than emulating it with per-channel convs.)")
 
 
 def main():
