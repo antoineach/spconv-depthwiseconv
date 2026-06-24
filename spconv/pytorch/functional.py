@@ -357,6 +357,73 @@ class SubMConvFunction(Function):
         return input_bp, filters_bp, None, None, None, None, None, None, None, None, None
 
 
+class SparseConvDepthwiseFunction(Function):
+    """Autograd wrapper for the fused sparse depthwise convolution.
+
+    Handles regular, submanifold and inverse depthwise convolutions. The
+    forward/backward are implemented as a fused gather -> per-channel multiply
+    -> scatter-add, see :func:`spconv.pytorch.ops.indice_conv_depthwise`.
+    """
+    @staticmethod
+    @_TORCH_CUSTOM_FWD
+    def forward(ctx,
+                features,
+                filters,
+                indice_pairs,
+                indice_pair_num,
+                num_activate_out,
+                inverse=False,
+                subm=False,
+                bias: Optional[torch.Tensor] = None):
+        ctx.save_for_backward(indice_pairs, indice_pair_num, features, filters)
+        ctx.inverse = inverse
+        ctx.subm = subm
+        ctx.has_bias = bias is not None
+        try:
+            return ops.indice_conv_depthwise(features,
+                                             filters,
+                                             indice_pairs,
+                                             indice_pair_num,
+                                             num_activate_out,
+                                             inverse=inverse,
+                                             subm=subm,
+                                             bias=bias)
+        except Exception as e:
+            msg = "[Exception|indice_conv_depthwise]"
+            msg += f"feat={features.shape},w={filters.shape},pair={indice_pairs.shape},"
+            msg += f"pairnum={indice_pair_num},act={num_activate_out},subm={subm}"
+            print(msg, file=sys.stderr)
+            spconv_save_debug_data((indice_pairs, indice_pair_num))
+            raise e
+
+    @staticmethod
+    @once_differentiable
+    @_TORCH_CUSTOM_BWD
+    def backward(ctx, grad_output):
+        indice_pairs, indice_pair_num, features, filters = ctx.saved_tensors
+        try:
+            input_bp, filters_bp = ops.indice_conv_depthwise_backward(
+                features,
+                filters,
+                grad_output,
+                indice_pairs,
+                indice_pair_num,
+                inverse=ctx.inverse,
+                subm=ctx.subm)
+        except Exception as e:
+            msg = "[Exception|indice_conv_depthwise_backward]"
+            msg += f"feat={features.shape},w={filters.shape},pair={indice_pairs.shape},"
+            msg += f"pairnum={indice_pair_num},do={grad_output.shape}"
+            print(msg, file=sys.stderr)
+            spconv_save_debug_data((indice_pairs, indice_pair_num))
+            raise e
+        bias_bp = None
+        if ctx.has_bias:
+            # bias is broadcast-added to every output point.
+            bias_bp = grad_output.sum(0)
+        return input_bp, filters_bp, None, None, None, None, None, bias_bp
+
+
 class SparseMaxPoolFunction(Function):
     @staticmethod
     @_TORCH_CUSTOM_FWD
@@ -421,6 +488,7 @@ class SparseAvgPoolImplicitGemmFunction(Function):
 
 
 indice_conv = SparseConvFunction.apply
+indice_conv_depthwise = SparseConvDepthwiseFunction.apply
 implicit_gemm = SparseImplicitGemmFunction.apply
 indice_inverse_conv = SparseInverseConvFunction.apply
 indice_subm_conv = SubMConvFunction.apply

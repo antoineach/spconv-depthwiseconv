@@ -1,4 +1,8 @@
 # Changelog
+## [Unreleased]
+### Added
+- Ultra fast sparse depthwise convolution (`groups == channels`): `SubMConvDepthwise{1,2,3,4}d` and `SparseConvDepthwise{1,2,3,4}d`. These skip the dense gather-matmul-scatter GEMM entirely and use a fused gather -> per-channel multiply -> scatter-add, which is far faster and lighter than emulating depthwise with per-channel `groups=1` convs. Forward/backward are exposed at the op level (`ops.indice_conv_depthwise`) and functional level (`functional.indice_conv_depthwise`).
+
 ## [2.3.8] - 2024-12-15
 ### Fixed 
 - fix os version in CI to resolve windows mismatch compiler problem

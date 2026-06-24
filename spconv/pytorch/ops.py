@@ -1447,6 +1447,120 @@ def indice_conv_backward(features: torch.Tensor,
     return (din, dfilters.reshape(filters_shape))
 
 
+def indice_conv_depthwise(features: torch.Tensor,
+                          filters: torch.Tensor,
+                          indice_pairs: torch.Tensor,
+                          indice_pair_num: torch.Tensor,
+                          num_activate_out: int,
+                          inverse: bool = False,
+                          subm: bool = False,
+                          bias: Optional[torch.Tensor] = None):
+    """Ultra fast sparse depthwise convolution forward.
+
+    Depthwise convolution applies one independent scalar weight per channel
+    for every spatial offset of the kernel (``groups == in_channels ==
+    out_channels``). This removes the dense gather-matmul-scatter GEMM used by
+    regular spconv and replaces it with a fused gather -> per-channel multiply
+    -> scatter-add, which is heavily memory bound and therefore much faster
+    than running ``in_channels`` independent group convolutions.
+
+    Args:
+        features: ``[num_points, C]`` input features.
+        filters: ``[kv, C]`` per-channel kernel weights (``kv`` is the kernel
+            volume, e.g. ``27`` for a ``3x3x3`` kernel).
+        indice_pairs: ``[2, kv, max_num]`` rulebook from ``get_indice_pairs``.
+        indice_pair_num: ``[kv]`` number of valid pairs for each kernel offset.
+        num_activate_out: number of output points.
+        inverse: whether this is an inverse (transposed) convolution.
+        subm: whether this is a submanifold convolution.
+        bias: optional ``[C]`` bias added to the output.
+    """
+    if not features.is_contiguous():
+        features = features.contiguous()
+    assert features.dim() == 2, "depthwise features must be [num_points, C]"
+    C = features.shape[1]
+    assert filters.dim() == 2 and filters.shape[1] == C, (
+        "depthwise filters must be [kv, C] with C matching feature channels")
+    kv = filters.shape[0]
+    kv_center = kv // 2
+
+    indice_pair_num_cpu = indice_pair_num.cpu().tolist()
+    pair_in = indice_pairs[int(inverse)]
+    pair_out = indice_pairs[int(not inverse)]
+
+    if subm:
+        # center offset is an identity mapping (every point maps to itself),
+        # so it can be computed without touching the rulebook.
+        out_features = features * filters[kv_center]
+    else:
+        out_features = torch.zeros((num_activate_out, C),
+                                   dtype=features.dtype,
+                                   device=features.device)
+
+    for i, nhot in enumerate(indice_pair_num_cpu):
+        if subm and i == kv_center:
+            continue
+        if nhot <= 0:
+            continue
+        in_inds = pair_in[i, :nhot].long()
+        out_inds = pair_out[i, :nhot].long()
+        gathered = features.index_select(0, in_inds)
+        gathered = gathered * filters[i]
+        out_features.index_add_(0, out_inds, gathered)
+
+    if bias is not None:
+        out_features = out_features + bias
+    return out_features
+
+
+def indice_conv_depthwise_backward(features: torch.Tensor,
+                                   filters: torch.Tensor,
+                                   grad_output: torch.Tensor,
+                                   indice_pairs: torch.Tensor,
+                                   indice_pair_num: torch.Tensor,
+                                   inverse: bool = False,
+                                   subm: bool = False):
+    """Backward pass of :func:`indice_conv_depthwise`.
+
+    Returns ``(grad_features, grad_filters)`` with the same shapes as
+    ``features`` and ``filters``.
+    """
+    if not features.is_contiguous():
+        features = features.contiguous()
+    if not grad_output.is_contiguous():
+        grad_output = grad_output.contiguous()
+    C = features.shape[1]
+    kv = filters.shape[0]
+    kv_center = kv // 2
+
+    indice_pair_num_cpu = indice_pair_num.cpu().tolist()
+    pair_in = indice_pairs[int(inverse)]
+    pair_out = indice_pairs[int(not inverse)]
+
+    grad_filters = torch.zeros_like(filters)
+    if subm:
+        grad_features = grad_output * filters[kv_center]
+        grad_filters[kv_center] = (grad_output * features).sum(0)
+    else:
+        grad_features = torch.zeros_like(features)
+
+    for i, nhot in enumerate(indice_pair_num_cpu):
+        if subm and i == kv_center:
+            continue
+        if nhot <= 0:
+            continue
+        in_inds = pair_in[i, :nhot].long()
+        out_inds = pair_out[i, :nhot].long()
+        in_gathered = features.index_select(0, in_inds)
+        go_gathered = grad_output.index_select(0, out_inds)
+        # dL/dw[i] = sum over matched pairs of (in * grad_out)
+        grad_filters[i] = (in_gathered * go_gathered).sum(0)
+        # dL/din at the gathered input points = grad_out * w[i]
+        grad_features.index_add_(0, in_inds, go_gathered * filters[i])
+
+    return grad_features, grad_filters
+
+
 def implicit_gemm(features: torch.Tensor,
                   filters: torch.Tensor,
                   pair_fwd: torch.Tensor,

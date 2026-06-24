@@ -1288,6 +1288,233 @@ class SubMConv4d(SparseConvolution):
                              name=name)
 
 
+class SparseConvolutionDepthwise(SparseModule):
+    """Ultra fast sparse depthwise convolution (``groups == channels``).
+
+    A depthwise convolution applies an independent scalar weight per channel
+    for each spatial offset of the kernel. Because every channel is processed
+    independently there is no cross-channel mixing, so the dense
+    gather-matmul-scatter GEMM used by :class:`SparseConvolution` is replaced
+    by a fused gather -> per-channel multiply -> scatter-add. This makes it
+    dramatically faster (and lighter on memory) than emulating a depthwise
+    layer with ``channels`` independent ``groups=1`` convolutions.
+
+    The weight has shape ``[channels, *kernel_size, 1]`` (KRSC layout with a
+    single input channel per group), matching the convention used by the rest
+    of spconv so checkpoints stay consistent.
+    """
+    __constants__ = [
+        'stride', 'padding', 'dilation', 'groups', 'bias', 'subm', 'inverse',
+        'transposed', 'output_padding'
+    ]
+
+    def __init__(self,
+                 ndim: int,
+                 channels: int,
+                 kernel_size: Union[int, List[int], Tuple[int, ...]] = 3,
+                 stride: Union[int, List[int], Tuple[int, ...]] = 1,
+                 padding: Union[int, List[int], Tuple[int, ...]] = 0,
+                 dilation: Union[int, List[int], Tuple[int, ...]] = 1,
+                 bias: bool = True,
+                 subm: bool = False,
+                 output_padding: Union[int, List[int], Tuple[int, ...]] = 0,
+                 transposed: bool = False,
+                 inverse: bool = False,
+                 indice_key: Optional[str] = None,
+                 name=None,
+                 device=None,
+                 dtype=None):
+        SparseModule.__init__(self, name=name)
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.ndim = ndim
+        self.channels = channels
+        # keep in/out_channels attributes for compatibility with tooling that
+        # introspects sparse conv layers.
+        self.in_channels = channels
+        self.out_channels = channels
+        self.groups = channels
+        self.kernel_size = expand_nd(ndim, kernel_size)
+        self.stride = expand_nd(ndim, stride)
+        self.dilation = expand_nd(ndim, dilation)
+        self.padding = expand_nd(ndim, padding)
+        self.output_padding = expand_nd(ndim, output_padding)
+        self.subm = subm
+        self.inverse = inverse
+        self.transposed = transposed
+        self.indice_key = indice_key
+        # depthwise always uses the Native rulebook (gather/scatter based).
+        self.algo = ConvAlgo.Native
+        self.kv = int(np.prod(self.kernel_size))
+        # KRSC-like layout: [out_channels, *kernel_size, in_channels_per_group]
+        self.weight_shape = [channels, *self.kernel_size, 1]
+        self.weight = Parameter(torch.zeros(*self.weight_shape,
+                                            **factory_kwargs))
+        if bias:
+            self.bias = Parameter(torch.zeros(channels, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # depthwise fan_in is the kernel volume (one input channel per group).
+        a = math.sqrt(0.005) if SPCONV_DEBUG_WEIGHT else math.sqrt(5)
+        gain = calculate_gain('leaky_relu', a)
+        std = gain / math.sqrt(self.kv)
+        bound = math.sqrt(3.0) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+        if self.bias is not None:
+            bias_bound = 1 / math.sqrt(self.kv)
+            init.uniform_(self.bias, -bias_bound, bias_bound)
+
+    def extra_repr(self):
+        s = ('{channels}, kernel_size={kernel_size}, stride={stride}')
+        if self.padding != (0, ) * len(self.padding):
+            s += ', padding={padding}'
+        if self.dilation != (1, ) * len(self.dilation):
+            s += ', dilation={dilation}'
+        if self.output_padding != (0, ) * len(self.output_padding):
+            s += ', output_padding={output_padding}'
+        if self.bias is None:
+            s += ', bias=False'
+        s += ', depthwise=True'
+        return s.format(**self.__dict__)
+
+    def forward(self, input: SparseConvTensor):
+        assert isinstance(input, SparseConvTensor)
+        assert input.features.shape[1] == self.channels, (
+            "channel size mismatch for depthwise conv")
+        features = input.features
+        indices = input.indices
+        spatial_shape = input.spatial_shape
+        batch_size = input.batch_size
+        if not features.is_contiguous():
+            features = features.contiguous()
+
+        if not self.subm:
+            if self.transposed:
+                out_spatial_shape = ops.get_deconv_output_size(
+                    spatial_shape, self.kernel_size, self.stride, self.padding,
+                    self.dilation, self.output_padding)
+            else:
+                out_spatial_shape = ops.get_conv_output_size(
+                    spatial_shape, self.kernel_size, self.stride, self.padding,
+                    self.dilation)
+        else:
+            out_spatial_shape = spatial_shape
+
+        out_tensor = input.shadow_copy()
+        indice_dict = input.indice_dict.copy()
+
+        datas = input.find_indice_pair(self.indice_key)
+        if self.inverse:
+            assert datas is not None and self.indice_key is not None
+            assert datas.is_subm is False, (
+                "inverse conv can only be used with standard conv and pool ops.")
+            outids = datas.indices
+            indice_pairs = datas.indice_pairs
+            indice_pair_num = datas.indice_pair_num
+            out_spatial_shape = datas.spatial_shape
+        elif self.indice_key is not None and datas is not None:
+            outids = datas.out_indices
+            indice_pairs = datas.indice_pairs
+            indice_pair_num = datas.indice_pair_num
+            assert self.subm, "only support reuse subm indices"
+        else:
+            outids, indice_pairs, indice_pair_num = ops.get_indice_pairs(
+                indices, batch_size, spatial_shape, self.algo,
+                self.kernel_size, self.stride, self.padding, self.dilation,
+                self.output_padding, self.subm, self.transposed)
+            indice_data = IndiceData(outids,
+                                     indices,
+                                     indice_pairs,
+                                     indice_pair_num,
+                                     spatial_shape,
+                                     out_spatial_shape,
+                                     is_subm=self.subm,
+                                     algo=self.algo,
+                                     ksize=self.kernel_size,
+                                     stride=self.stride,
+                                     padding=self.padding,
+                                     dilation=self.dilation)
+            if self.indice_key is not None:
+                msg = f"your indice key {self.indice_key} already exists in this sparse tensor."
+                assert self.indice_key not in indice_dict, msg
+                indice_dict[self.indice_key] = indice_data
+
+        indice_pairs_calc = indice_pairs
+        if indice_pairs.device != features.device:
+            indice_pairs_calc = indice_pairs.to(features.device)
+        # [channels, *ksize, 1] -> [kv, channels]
+        filters = self.weight.reshape(self.channels, self.kv).t().contiguous()
+        out_features = Fsp.indice_conv_depthwise(features, filters,
+                                                 indice_pairs_calc,
+                                                 indice_pair_num,
+                                                 outids.shape[0], self.inverse,
+                                                 self.subm, self.bias)
+        out_tensor = out_tensor.replace_feature(out_features)
+        out_tensor.indices = outids
+        out_tensor.indice_dict = indice_dict
+        out_tensor.spatial_shape = out_spatial_shape
+        return out_tensor
+
+
+class SubMConvDepthwise1d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(1, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=True, indice_key=indice_key, name=name)
+
+
+class SubMConvDepthwise2d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(2, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=True, indice_key=indice_key, name=name)
+
+
+class SubMConvDepthwise3d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(3, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=True, indice_key=indice_key, name=name)
+
+
+class SubMConvDepthwise4d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(4, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=True, indice_key=indice_key, name=name)
+
+
+class SparseConvDepthwise1d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(1, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=False, indice_key=indice_key, name=name)
+
+
+class SparseConvDepthwise2d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(2, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=False, indice_key=indice_key, name=name)
+
+
+class SparseConvDepthwise3d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(3, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=False, indice_key=indice_key, name=name)
+
+
+class SparseConvDepthwise4d(SparseConvolutionDepthwise):
+    def __init__(self, channels, kernel_size, stride=1, padding=0, dilation=1,
+                 bias=True, indice_key=None, name=None):
+        super().__init__(4, channels, kernel_size, stride, padding, dilation,
+                         bias, subm=False, indice_key=indice_key, name=name)
+
+
 DEFAULT_SPARSE_CONV_TYPES = {
     SubMConv1d,
     SubMConv2d,
