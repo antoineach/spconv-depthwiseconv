@@ -12,7 +12,12 @@ from spconv.pytorch.conv import (SparseConv1d, SparseConv2d, SparseConv3d,
                                  SparseConvTranspose4d, SparseInverseConv1d,
                                  SparseInverseConv2d, SparseInverseConv3d,
                                  SparseInverseConv4d, SubMConv1d, SubMConv2d,
-                                 SubMConv3d, SubMConv4d)
+                                 SubMConv3d, SubMConv4d,
+                                 SparseConvolutionDepthwise,
+                                 SparseConvDepthwise1d, SparseConvDepthwise2d,
+                                 SparseConvDepthwise3d, SparseConvDepthwise4d,
+                                 SubMConvDepthwise1d, SubMConvDepthwise2d,
+                                 SubMConvDepthwise3d, SubMConvDepthwise4d)
 from spconv.pytorch.identity import Identity
 from spconv.pytorch.modules import (SparseModule, SparseSequential,
                                     assign_name_for_sparse_modules, SparseBatchNorm,
