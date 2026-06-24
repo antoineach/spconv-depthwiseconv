@@ -17,11 +17,12 @@ quelques secondes avec `uv`. Active le GPU, puis :
 !uv venv --python 3.11 /content/sp311
 PY = "/content/sp311/bin/python"
 
+# uv installe directement dans le venv (pas besoin de pip dedans).
 # binaires uniquement : torch CUDA + spconv prebuilt + ninja (JIT du kernel)
-!{PY} -m pip -q install --only-binary=:all: torch numpy ninja
-!{PY} -m pip -q install --only-binary=:all: "spconv-cu120==2.3.8"
+!uv pip install -q --python {PY} --only-binary=:all: torch numpy ninja
+!uv pip install -q --python {PY} --only-binary=:all: "spconv-cu120==2.3.8"
 
-# sanity : cet import NE DOIT PAS compiler quoi que ce soit
+# sanity : cet import NE DOIT RIEN compiler
 !{PY} -c "import cumm, spconv, torch; print('OK', torch.__version__, 'cuda', torch.cuda.is_available())"
 
 # clone + overlay (patche le spconv DU VENV) + verify
@@ -30,6 +31,9 @@ PY = "/content/sp311/bin/python"
 !cd /content/spconv-depthwiseconv && {PY} tools/install_depthwise_over_prebuilt.py
 !cd /content && {PY} /content/spconv-depthwiseconv/test/verify_depthwise.py
 ```
+
+> Note : `uv venv` ne met PAS `pip` dans le venv — c'est pourquoi on installe
+> avec `uv pip install --python {PY}` (et pas `{PY} -m pip`).
 
 Si tu avais déjà tenté un `pip install` qui a cassé `cumm`, fais d'abord
 *Exécution → Redémarrer la session* avant de lancer cette cellule.
