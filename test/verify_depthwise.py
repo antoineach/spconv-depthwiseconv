@@ -239,6 +239,11 @@ def benchmark(device="cuda", shape=(40, 40, 40), num_points=30000, ks=3,
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device = {device}")
+    from spconv.pytorch.depthwise_kernel import get_depthwise_kernel
+    print("compiling / loading fused CUDA kernel (first run may take a while)...")
+    backend = "fused CUDA kernel" if get_depthwise_kernel() is not None \
+        else "pure-torch fallback"
+    print(f"depthwise backend = {backend}")
     results = []
     # float64 on cuda gives exact agreement with the dense reference.
     results.append(verify_case(subm=True, stride=1, padding=1, device=device))

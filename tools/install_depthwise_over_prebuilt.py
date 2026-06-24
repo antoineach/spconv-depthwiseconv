@@ -44,6 +44,7 @@ FILES = [
     "pytorch/functional.py",
     "pytorch/conv.py",
     "pytorch/__init__.py",
+    "pytorch/depthwise_kernel.py",
 ]
 
 
