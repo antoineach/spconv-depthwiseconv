@@ -4,7 +4,37 @@ Sur Linux il n'y a **pas besoin de MSVC** : le kernel CUDA fusé est compilé en
 JIT par `nvcc` + `gcc`, déjà présents sur Colab/Kaggle. C'est donc l'endroit
 idéal pour valider le backend `fused CUDA kernel` et lancer le benchmark.
 
-## Google Colab
+## Méthode robuste : venv Python 3.11 (recommandée)
+
+Colab tourne en **Python 3.12**, pour lequel spconv/cumm n'ont pas toujours de
+`core_cc` précompilé → `import spconv` essaie de compiler `cumm` depuis la
+source et échoue (`tensorview/...: No such file`). La solution sûre est de
+travailler dans un venv **Python 3.11** (wheels cp311 fiables), créé en
+quelques secondes avec `uv`. Active le GPU, puis :
+
+```python
+!pip -q install uv
+!uv venv --python 3.11 /content/sp311
+PY = "/content/sp311/bin/python"
+
+# binaires uniquement : torch CUDA + spconv prebuilt + ninja (JIT du kernel)
+!{PY} -m pip -q install --only-binary=:all: torch numpy ninja
+!{PY} -m pip -q install --only-binary=:all: "spconv-cu120==2.3.8"
+
+# sanity : cet import NE DOIT PAS compiler quoi que ce soit
+!{PY} -c "import cumm, spconv, torch; print('OK', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# clone + overlay (patche le spconv DU VENV) + verify
+!rm -rf /content/spconv-depthwiseconv
+!git clone -q --branch claude/magical-ramanujan-lb921d https://github.com/antoineach/spconv-depthwiseconv.git /content/spconv-depthwiseconv
+!cd /content/spconv-depthwiseconv && {PY} tools/install_depthwise_over_prebuilt.py
+!cd /content && {PY} /content/spconv-depthwiseconv/test/verify_depthwise.py
+```
+
+Si tu avais déjà tenté un `pip install` qui a cassé `cumm`, fais d'abord
+*Exécution → Redémarrer la session* avant de lancer cette cellule.
+
+## (Alternative) Python 3.12 natif de Colab
 
 1. Ouvre https://colab.research.google.com → *Nouveau notebook*.
 2. Menu **Exécution → Modifier le type d'exécution → Accélérateur matériel : GPU**.
