@@ -8,12 +8,22 @@ idéal pour valider le backend `fused CUDA kernel` et lancer le benchmark.
 
 1. Ouvre https://colab.research.google.com → *Nouveau notebook*.
 2. Menu **Exécution → Modifier le type d'exécution → Accélérateur matériel : GPU**.
-3. Colle et exécute la cellule suivante (installe spconv précompilé + applique
-   le patch depthwise + lance la vérification) :
+3. Colle et exécute la cellule suivante (installe spconv **précompilé** +
+   applique le patch depthwise + lance la vérification) :
 
 ```python
-# 1) spconv précompilé qui matche le CUDA de Colab (cu120 marche sur CUDA 12.x)
-!pip -q install spconv-cu120
+# 0) infos environnement (Colab récent = Python 3.12)
+!python -V && nvcc --version | tail -1
+
+# 1) spconv PRÉCOMPILÉ. IMPORTANT: --only-binary empêche pip de retomber sur le
+#    paquet `cumm` source (qui essaie de se compiler à l'import et échoue).
+#    Choisis une variante CUDA qui publie des wheels pour ta version de Python:
+#    cu126/cu124 ont des prebuilts cp312/cp313 en 2.3.8 (cu120 souvent non).
+!pip -q install --only-binary=:all: "spconv-cu126==2.3.8" || \
+ pip -q install --only-binary=:all: "spconv-cu124==2.3.8"
+
+# sanity: cet import NE DOIT PAS déclencher de compilation cumm/ninja
+!python -c "import cumm, spconv; print('cumm/spconv import OK')"
 
 # 2) récupère la branche avec la depthwise
 !rm -rf /content/spconv-depthwiseconv
@@ -29,6 +39,12 @@ idéal pour valider le backend `fused CUDA kernel` et lancer le benchmark.
 %cd /content
 !python /content/spconv-depthwiseconv/test/verify_depthwise.py
 ```
+
+> **`import spconv` lance une compilation `ninja` qui échoue** (`tensorview/...:
+> No such file`) ? Ça veut dire que le wheel installé n'est PAS un prebuilt pour
+> ta version de Python (pip a pris le `cumm` source). Réinstalle avec
+> `--only-binary=:all:` et une variante CUDA qui a des wheels cp3.x (cu126/cu124
+> en 2.3.8). Ce problème vient de spconv/cumm lui-même, pas de la depthwise.
 
 La **première exécution compile le kernel CUDA** (~30-60 s, c'est normal). Tu
 dois voir :
