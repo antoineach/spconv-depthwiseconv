@@ -46,6 +46,7 @@ from spconv.constants import FILTER_HWIO, ALL_WEIGHT_IS_KRSC, AllocKeys, SPCONV_
 from cumm.gemm import codeops
 from spconv.tools import CUDAKernelTimer
 from spconv import constants
+from spconv.pytorch.depthwise_kernel import get_depthwise_kernel
 
 DEBUG = False
 DEBUG_INT64_HASH_K = False
@@ -1488,6 +1489,9 @@ def indice_conv_depthwise(features: torch.Tensor,
     pair_in = indice_pairs[int(inverse)]
     pair_out = indice_pairs[int(not inverse)]
 
+    if not filters.is_contiguous():
+        filters = filters.contiguous()
+
     if subm:
         # center offset is an identity mapping (every point maps to itself),
         # so it can be computed without touching the rulebook.
@@ -1497,20 +1501,39 @@ def indice_conv_depthwise(features: torch.Tensor,
                                    dtype=features.dtype,
                                    device=features.device)
 
-    # Per kernel offset: gather -> multiply by the per-channel weight (a cheap
-    # [C] broadcast, no weight buffer) -> scatter-add. Small reused buffers
-    # keep this memory bound and cache friendly. ``filters[i]`` never
-    # materialises a [T, C] tensor, unlike a single flattened pass.
-    for i, nhot in _depthwise_offsets(indice_pair_num_cpu, kv, kv_center, subm):
-        in_inds = pair_in[i, :nhot].long()
-        out_inds = pair_out[i, :nhot].long()
-        gathered = features.index_select(0, in_inds)
-        gathered *= filters[i]
-        out_features.index_add_(0, out_inds, gathered)
+    kernel = get_depthwise_kernel() if features.is_cuda else None
+    if kernel is not None:
+        # fused single-pass gather -> multiply -> scatter-add (no [nhot, C]
+        # intermediate buffer).
+        pin, pout, pnum_cpu = _depthwise_pairs_for_kernel(
+            indice_pairs, indice_pair_num, inverse)
+        kernel.depthwise_forward(out_features, features, filters, pin, pout,
+                                 pnum_cpu, subm)
+    else:
+        # pure-torch fallback: per kernel offset gather -> [C] broadcast
+        # multiply -> scatter-add. Small reused buffers, no weight buffer.
+        for i, nhot in _depthwise_offsets(indice_pair_num_cpu, kv, kv_center,
+                                          subm):
+            in_inds = pair_in[i, :nhot].long()
+            out_inds = pair_out[i, :nhot].long()
+            gathered = features.index_select(0, in_inds)
+            gathered *= filters[i]
+            out_features.index_add_(0, out_inds, gathered)
 
     if bias is not None:
         out_features = out_features + bias
     return out_features
+
+
+def _depthwise_pairs_for_kernel(indice_pairs, indice_pair_num, inverse):
+    """Prepare contiguous int32 rulebook rows + cpu counts for the CUDA kernel."""
+    pin = indice_pairs[int(inverse)].contiguous()
+    pout = indice_pairs[int(not inverse)].contiguous()
+    if pin.dtype != torch.int32:
+        pin = pin.to(torch.int32)
+        pout = pout.to(torch.int32)
+    pnum_cpu = indice_pair_num.detach().to("cpu", torch.int32).contiguous()
+    return pin, pout, pnum_cpu
 
 
 def _depthwise_offsets(indice_pair_num_cpu, kv, kv_center, subm):
@@ -1551,6 +1574,8 @@ def indice_conv_depthwise_backward(features: torch.Tensor,
     kv = filters.shape[0]
     kv_center = kv // 2
 
+    if not filters.is_contiguous():
+        filters = filters.contiguous()
     indice_pair_num_cpu = indice_pair_num.cpu().tolist()
     pair_in = indice_pairs[int(inverse)]
     pair_out = indice_pairs[int(not inverse)]
@@ -1562,15 +1587,24 @@ def indice_conv_depthwise_backward(features: torch.Tensor,
     else:
         grad_features = torch.zeros_like(features)
 
-    for i, nhot in _depthwise_offsets(indice_pair_num_cpu, kv, kv_center, subm):
-        in_inds = pair_in[i, :nhot].long()
-        out_inds = pair_out[i, :nhot].long()
-        in_gathered = features.index_select(0, in_inds)
-        go_gathered = grad_output.index_select(0, out_inds)
-        # dL/dw[i] = sum over matched pairs of (in * grad_out)
-        grad_filters[i] = (in_gathered * go_gathered).sum(0)
-        # dL/din at the gathered input points = grad_out * w[i]
-        grad_features.index_add_(0, in_inds, go_gathered * filters[i])
+    kernel = get_depthwise_kernel() if features.is_cuda else None
+    if kernel is not None:
+        pin, pout, pnum_cpu = _depthwise_pairs_for_kernel(
+            indice_pairs, indice_pair_num, inverse)
+        kernel.depthwise_backward(grad_features, grad_filters, features,
+                                  grad_output, filters, pin, pout, pnum_cpu,
+                                  subm)
+    else:
+        for i, nhot in _depthwise_offsets(indice_pair_num_cpu, kv, kv_center,
+                                          subm):
+            in_inds = pair_in[i, :nhot].long()
+            out_inds = pair_out[i, :nhot].long()
+            in_gathered = features.index_select(0, in_inds)
+            go_gathered = grad_output.index_select(0, out_inds)
+            # dL/dw[i] = sum over matched pairs of (in * grad_out)
+            grad_filters[i] = (in_gathered * go_gathered).sum(0)
+            # dL/din at the gathered input points = grad_out * w[i]
+            grad_features.index_add_(0, in_inds, go_gathered * filters[i])
 
     return grad_features, grad_filters
 
