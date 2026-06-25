@@ -2,7 +2,8 @@
 ## [Unreleased]
 ### Added
 - Ultra fast sparse depthwise convolution (`groups == channels`): `SubMConvDepthwise{1,2,3,4}d` and `SparseConvDepthwise{1,2,3,4}d`. These skip the dense gather-matmul-scatter GEMM entirely and use a fused gather -> per-channel multiply -> scatter-add, which is far faster and lighter than emulating depthwise with per-channel `groups=1` convs. Forward/backward are exposed at the op level (`ops.indice_conv_depthwise`) and functional level (`functional.indice_conv_depthwise`).
-- Optional fused CUDA kernel for the depthwise conv (`spconv/pytorch/depthwise_kernel.py`), JIT compiled via `torch.utils.cpp_extension.load_inline` on first use: a true single-pass gather/multiply/scatter with no `[nhot, C]` intermediate buffer. Falls back transparently to the pure-torch path when no CUDA toolchain is available; set `SPCONV_DEPTHWISE_DISABLE_CUDA=1` to force the fallback.
+- Optional fused CUDA kernel for the depthwise conv (`spconv/pytorch/depthwise_kernel.py`), JIT compiled via `torch.utils.cpp_extension.load_inline` on first use: a true single-pass gather/multiply/scatter with no `[nhot, C]` intermediate buffer. The forward and input-gradient scatters are atomic-free (each kernel offset is an injective map, so addresses are distinct within a launch); only the weight-gradient reduction uses atomics. Beats the equivalent full conv (measured ~1.2-2.4x, growing with channel count) and is 20-150x faster than emulating depthwise with per-channel convs. Falls back transparently to the pure-torch path when no CUDA toolchain is available; set `SPCONV_DEPTHWISE_DISABLE_CUDA=1` to force the fallback.
+- `tools/build_patched_wheel.py` repacks a prebuilt spconv wheel with the depthwise files into a drop-in `.whl` (no spconv recompilation), so the feature can be distributed via a GitHub Release. See `docs/BUILD_WHEEL.md` and `docs/COLAB_depthwise.md`.
 
 ## [2.3.8] - 2024-12-15
 ### Fixed 

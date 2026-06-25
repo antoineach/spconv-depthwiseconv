@@ -49,6 +49,11 @@ _CUDA_SOURCE = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Atomic.cuh>
 
+// For a single kernel offset the (input -> output) mapping is a translation,
+// hence injective: within one launch every (out_idx, c) address is distinct,
+// so the scatter needs NO atomics. Accumulation across offsets is safe because
+// the launches are sequential on the same stream. Only the weight gradient
+// (a reduction over all pairs into C values) needs atomicAdd.
 template <typename scalar_t>
 __global__ void dw_fwd_kernel(scalar_t* __restrict__ out,
                               const scalar_t* __restrict__ feat,
@@ -63,7 +68,7 @@ __global__ void dw_fwd_kernel(scalar_t* __restrict__ out,
   long c = tid - j * C;
   long ii = in_inds[j];
   long oo = out_inds[j];
-  gpuAtomicAdd(&out[oo * C + c], feat[ii * C + c] * w[c]);
+  out[oo * C + c] += feat[ii * C + c] * w[c];  // distinct addr per launch
 }
 
 template <typename scalar_t>
@@ -83,8 +88,8 @@ __global__ void dw_bwd_kernel(scalar_t* __restrict__ grad_feat,
   long ii = in_inds[j];
   long oo = out_inds[j];
   scalar_t go = grad_out[oo * C + c];
-  gpuAtomicAdd(&grad_feat[ii * C + c], go * w[c]);
-  gpuAtomicAdd(&grad_w[c], feat[ii * C + c] * go);
+  grad_feat[ii * C + c] += go * w[c];      // in_idx distinct per launch
+  gpuAtomicAdd(&grad_w[c], feat[ii * C + c] * go);  // reduction -> atomic
 }
 
 static inline int mirror_nhot(const int* pnum, int kv, int kv_center,
@@ -179,6 +184,11 @@ def get_depthwise_kernel():
             if not torch.cuda.is_available():
                 _KERNEL = None
                 return None
+            # Compile only for the current GPU (faster build, no warning) when
+            # the user hasn't pinned the arch list explicitly.
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                major, minor = torch.cuda.get_device_capability()
+                os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
             from torch.utils.cpp_extension import load_inline
             _KERNEL = load_inline(
                 name="spconv_depthwise_cuda",
