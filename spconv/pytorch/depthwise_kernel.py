@@ -28,6 +28,13 @@ the AOT build (``packaging/setup.py``), so there is a single source of truth.
 
 Env vars:
   SPCONV_DEPTHWISE_DISABLE_CUDA=1   force the pure-torch fallback.
+  SPCONV_DEPTHWISE_REQUIRE_KERNEL=1 strict mode: the precompiled extension MUST
+                                    load, otherwise raise. No JIT, no torch
+                                    fallback. Use this when shipping a
+                                    precompiled wheel and you want a hard error
+                                    instead of a silent slow path.
+  SPCONV_DEPTHWISE_DISABLE_JIT=1    never JIT compile (precompiled or torch
+                                    fallback only).
   TORCH_CUDA_ARCH_LIST=...          archs for the JIT build (defaults to the
                                     current GPU only).
 """
@@ -65,23 +72,62 @@ def get_depthwise_kernel():
 
 
 def _resolve_kernel():
+    require = os.environ.get("SPCONV_DEPTHWISE_REQUIRE_KERNEL", "0") == "1"
     if os.environ.get("SPCONV_DEPTHWISE_DISABLE_CUDA", "0") == "1":
+        if require:
+            raise RuntimeError(
+                "SPCONV_DEPTHWISE_REQUIRE_KERNEL=1 but SPCONV_DEPTHWISE_DISABLE"
+                "_CUDA=1; these are contradictory.")
         return None
     try:
         import torch
-    except Exception:
+    except Exception as e:
+        if require:
+            raise RuntimeError(f"cannot import torch: {e}")
         return None
     if not torch.cuda.is_available():
+        if require:
+            raise RuntimeError("CUDA is not available")
         return None
+
+    # On Windows the precompiled .pyd needs torch's DLLs (c10, torch_cuda,
+    # cudart, ...) on the loader search path. Importing torch (above) registers
+    # them via os.add_dll_directory; do it explicitly too for robustness.
+    if os.name == "nt":
+        try:
+            torch_lib = Path(torch.__file__).parent / "lib"
+            if torch_lib.is_dir():
+                os.add_dll_directory(str(torch_lib))
+        except Exception:
+            pass
 
     # 1) precompiled extension shipped in the wheel -> zero compilation.
     try:
         import spconv_depthwise_C  # type: ignore
         return spconv_depthwise_C
-    except Exception:
-        pass
+    except ImportError as e:
+        precompiled_err = e
+    else:
+        precompiled_err = None
 
-    # 2) JIT compile from the shared .cu source.
+    # In strict mode we do NOT fall back: the shipped wheel must work.
+    if require:
+        raise ImportError(
+            "spconv depthwise: precompiled kernel 'spconv_depthwise_C' could "
+            "not be imported and SPCONV_DEPTHWISE_REQUIRE_KERNEL=1.\n"
+            f"  underlying error: {precompiled_err}\n"
+            "  common cause on Windows: a 'DLL load failed' means torch's DLLs "
+            "weren't found -- import torch BEFORE importing the kernel, and "
+            "ensure the wheel was built for THIS python/torch/CUDA. If the "
+            "extension is simply absent, rebuild the wheel with "
+            "tools/build_patched_wheel.py --precompile.")
+
+    # 2) JIT compile from the shared .cu source (dev convenience).
+    if os.environ.get("SPCONV_DEPTHWISE_DISABLE_JIT", "0") == "1":
+        import warnings
+        warnings.warn("spconv depthwise: precompiled kernel unavailable and "
+                      "JIT disabled; using the pure-torch fallback.")
+        return None
     try:
         if not _CU_SOURCE.exists():
             raise FileNotFoundError(_CU_SOURCE)
