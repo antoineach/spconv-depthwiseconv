@@ -21,6 +21,18 @@ couvrir plusieurs environnements, relance avec différents `--spec` (et
 idéalement sur différentes versions de Python) : chaque wheel est spécifique à
 un couple (CUDA, Python).
 
+### Tout offline (aucun téléchargement)
+
+`--spec` fait un `pip download` (réseau). Pour rester 100 % hors ligne, passe
+directement un wheel spconv **déjà présent localement** avec `--wheel` :
+
+```bash
+python tools/build_patched_wheel.py --wheel C:\chemin\spconv_cu120-2.3.8-...whl
+```
+
+Rien n'est téléchargé (l'outil `wheel` doit déjà être installé ; avec
+`--precompile`, `torch`/`cumm`/CUDA doivent aussi être présents).
+
 ## Installer
 
 ```bash

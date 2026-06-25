@@ -63,6 +63,9 @@ def main():
                     "this python/torch/OS)")
     ap.add_argument("--arch", default="7.5 8.0 8.6 8.9 12.0+PTX",
                     help="TORCH_CUDA_ARCH_LIST for --precompile (Turing..Blackwell)")
+    ap.add_argument("--wheel", default=None,
+                    help="path to a LOCAL prebuilt spconv .whl to repack "
+                    "(fully offline; skips the pip download of --spec)")
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -77,19 +80,28 @@ def main():
         d.mkdir(parents=True)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # ensure the 'wheel' tool is available
-    run([sys.executable, "-m", "pip", "install", "-q", "wheel"])
+    # ensure the 'wheel' tool is available (offline if already installed)
+    try:
+        import wheel  # noqa: F401
+    except Exception:
+        run([sys.executable, "-m", "pip", "install", "-q", "wheel"])
 
-    # 1) fetch the prebuilt wheel only (never build from source)
-    print(f"[1/4] downloading prebuilt wheel for {args.spec}")
-    run([sys.executable, "-m", "pip", "download", "--only-binary=:all:",
-         "--no-deps", args.spec, "-d", str(dl)])
-    whls = list(dl.glob("*.whl"))
-    if not whls:
-        raise SystemExit("no prebuilt wheel downloaded (no cp wheel for this "
-                         "python? try another CUDA variant / version)")
-    whl = whls[0]
-    print(f"      got {whl.name}")
+    # 1) obtain the prebuilt wheel (local file => fully offline, else download)
+    if args.wheel:
+        whl = Path(args.wheel).expanduser().resolve()
+        if not whl.is_file():
+            raise SystemExit(f"--wheel not found: {whl}")
+        print(f"[1/4] using local wheel {whl.name} (offline)")
+    else:
+        print(f"[1/4] downloading prebuilt wheel for {args.spec}")
+        run([sys.executable, "-m", "pip", "download", "--only-binary=:all:",
+             "--no-deps", args.spec, "-d", str(dl)])
+        whls = list(dl.glob("*.whl"))
+        if not whls:
+            raise SystemExit("no prebuilt wheel downloaded (no cp wheel for "
+                             "this python? try another CUDA variant / version)")
+        whl = whls[0]
+        print(f"      got {whl.name}")
 
     # 2) unpack
     print("[2/4] unpacking")
