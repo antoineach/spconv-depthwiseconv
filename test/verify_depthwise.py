@@ -183,20 +183,25 @@ def run_gradcheck(device="cuda"):
 #  Speed benchmark vs equivalent full conv                                    #
 # --------------------------------------------------------------------------- #
 def benchmark(device="cuda", shape=(40, 40, 40), num_points=30000, ks=3,
-              iters=50):
+              iters=200):
     if device != "cuda":
         print("\n(skip benchmark: needs cuda)")
         return
 
     def bench(fn):
-        for _ in range(5):
+        # warmup
+        for _ in range(10):
             fn()
         torch.cuda.synchronize()
-        t = time.time()
+        # accurate GPU-side timing (wall clock is too coarse on Windows).
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         for _ in range(iters):
             fn()
+        end.record()
         torch.cuda.synchronize()
-        return (time.time() - t) / iters * 1e3
+        return start.elapsed_time(end) / iters  # ms/iter
 
     print(f"\n=== benchmark (subm, N={num_points}, k={ks}) ===")
     print(f"  {'C':>5} | {'depthwise':>10} | {'full CxC':>10} | "
