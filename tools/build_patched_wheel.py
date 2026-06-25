@@ -126,18 +126,25 @@ def main():
     # 3b) optionally compile the fused kernel and bundle it (no JIT for users)
     if args.precompile:
         print("[3b] precompiling fused CUDA kernel (arch:", args.arch, ")")
-        built_lib = work / "extbuild"
-        if built_lib.exists():
-            shutil.rmtree(built_lib)
-        built_lib.mkdir(parents=True)
-        env = dict(os.environ, TORCH_CUDA_ARCH_LIST=args.arch)
+        # Build from a SHORT directory with a relative source filename so the
+        # mirrored build/temp path stays under Windows MAX_PATH (260 chars).
+        short = Path.home() / ".spconv_dw_build"
+        if short.exists():
+            shutil.rmtree(short, ignore_errors=True)
+        short.mkdir(parents=True)
+        shutil.copy2(src_pkg / "pytorch" / "csrc" / "depthwise.cu",
+                     short / "depthwise.cu")
+        built_lib = short / "lib"
+        env = dict(os.environ, TORCH_CUDA_ARCH_LIST=args.arch,
+                   SPCONV_DW_CU="depthwise.cu")
         setup_py = repo_root / "packaging" / "setup.py"
         subprocess.check_call(
-            [sys.executable, str(setup_py), "build_ext", "--build-lib",
-             str(built_lib)], cwd=str(repo_root / "packaging"), env=env)
+            [sys.executable, str(setup_py), "build_ext",
+             "--build-temp", str(short / "t"), "--build-lib", str(built_lib)],
+            cwd=str(short), env=env)
         exts = [p for p in built_lib.iterdir()
                 if p.name.startswith("spconv_depthwise_C")
-                and p.suffix in (".pyd", ".so")]
+                and p.suffix in (".pyd", ".so")] if built_lib.exists() else []
         if not exts:
             raise SystemExit(f"no compiled extension found in {built_lib}")
         for ext in exts:
