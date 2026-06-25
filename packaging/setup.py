@@ -23,7 +23,12 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 HERE = Path(__file__).resolve().parent
-CU = HERE.parent / "spconv" / "pytorch" / "csrc" / "depthwise.cu"
+# Source path: by default the in-repo .cu. Overridable via SPCONV_DW_CU so the
+# caller can compile from a SHORT working dir with a relative filename (avoids
+# Windows MAX_PATH issues where setuptools mirrors the absolute source path
+# under build/temp).
+CU = os.environ.get("SPCONV_DW_CU") or str(
+    HERE.parent / "spconv" / "pytorch" / "csrc" / "depthwise.cu")
 
 # default broad arch list; override with TORCH_CUDA_ARCH_LIST.
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5 8.0 8.6 8.9 12.0+PTX")
@@ -32,6 +37,6 @@ setup(
     name="spconv_depthwise_C",
     version="0.1.0",
     description="Precompiled fused depthwise conv CUDA kernel for spconv",
-    ext_modules=[CUDAExtension("spconv_depthwise_C", [str(CU)])],
+    ext_modules=[CUDAExtension("spconv_depthwise_C", [CU])],
     cmdclass={"build_ext": BuildExtension},
 )
