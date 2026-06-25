@@ -27,7 +27,7 @@ Notes
   Python (e.g. cu120/cu124/cu126; cp39-cp313 depending on release).
 """
 import argparse
-import glob
+import os
 import shutil
 import subprocess
 import sys
@@ -39,6 +39,7 @@ FILES = [
     "pytorch/conv.py",
     "pytorch/__init__.py",
     "pytorch/depthwise_kernel.py",
+    "pytorch/csrc/depthwise.cu",
 ]
 
 
@@ -55,6 +56,13 @@ def main():
     ap.add_argument("--build-number", default="1",
                     help="wheel build tag to distinguish from upstream")
     ap.add_argument("--workdir", default="build_wheel")
+    ap.add_argument("--precompile", action="store_true",
+                    help="compile the fused CUDA kernel and bundle it in the "
+                    "wheel so end users never JIT-compile (needs CUDA + a C++ "
+                    "toolchain on THIS machine; the wheel becomes specific to "
+                    "this python/torch/OS)")
+    ap.add_argument("--arch", default="7.5 8.0 8.6 8.9 12.0+PTX",
+                    help="TORCH_CUDA_ARCH_LIST for --precompile (Turing..Blackwell)")
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -99,10 +107,30 @@ def main():
         dst = pkg_dir / "spconv" / rel
         if not src.exists():
             raise SystemExit(f"missing source file: {src}")
-        if not dst.parent.exists():
-            raise SystemExit(f"target package has no {dst.parent}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
         print(f"      {rel}")
         shutil.copy2(src, dst)
+
+    # 3b) optionally compile the fused kernel and bundle it (no JIT for users)
+    if args.precompile:
+        print("[3b] precompiling fused CUDA kernel (arch:", args.arch, ")")
+        built_lib = work / "extbuild"
+        if built_lib.exists():
+            shutil.rmtree(built_lib)
+        built_lib.mkdir(parents=True)
+        env = dict(os.environ, TORCH_CUDA_ARCH_LIST=args.arch)
+        setup_py = repo_root / "packaging" / "setup.py"
+        subprocess.check_call(
+            [sys.executable, str(setup_py), "build_ext", "--build-lib",
+             str(built_lib)], cwd=str(repo_root / "packaging"), env=env)
+        exts = [p for p in built_lib.iterdir()
+                if p.name.startswith("spconv_depthwise_C")
+                and p.suffix in (".pyd", ".so")]
+        if not exts:
+            raise SystemExit(f"no compiled extension found in {built_lib}")
+        for ext in exts:
+            print(f"      bundling {ext.name}")
+            shutil.copy2(ext, pkg_dir / ext.name)  # top-level module in wheel
 
     # 4) repack (wheel pack regenerates RECORD hashes)
     print("[4/4] repacking")
