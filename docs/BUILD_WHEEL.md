@@ -5,6 +5,21 @@ backend déjà compilé de spconv. Inutile donc de recompiler spconv : on
 **repackage un wheel précompilé** en y injectant les fichiers patchés. Résultat
 = un seul `.whl` drop-in, installable par n'importe qui.
 
+> ⚠️ **Le wheel de base DOIT être un vrai prebuilt** (`spconv-cuXXX`, qui
+> embarque `spconv/core_cc`). Un wheel `spconv-...-py3-none-any.whl` est une
+> build « source » qui compile `core_cc` en JIT au runtime (cumm + ninja) :
+> repackagé tel quel, il **ne marchera pas** sur une machine sans toolchain
+> (erreur `No module named 'spconv.core_cc'`). Le builder t'avertit si le wheel
+> de base n'a pas `core_cc`.
+
+> ℹ️ spconv dépend aussi de **`cumm-cuXXX`** (prebuilt, avec son propre backend)
+> et de **torch-CUDA**. Sur la machine cible il faut donc installer, en plus de
+> notre wheel : `cumm-cuXXX` et un `torch` CUDA. Tout est téléchargeable en
+> wheels (offline) :
+> ```bash
+> pip download --only-binary=:all: --no-deps spconv-cu120==2.3.8 cumm-cu120 -d wheels_offline
+> ```
+
 ## Construire le wheel
 
 Sur n'importe quelle machine (aucun compilateur requis pour *construire* le
