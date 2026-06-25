@@ -45,6 +45,7 @@ FILES = [
     "pytorch/conv.py",
     "pytorch/__init__.py",
     "pytorch/depthwise_kernel.py",
+    "pytorch/csrc/depthwise.cu",
 ]
 
 
@@ -106,6 +107,7 @@ def main():
         print(f"  {dst}  <-  {rel}")
         if args.dry_run:
             continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
             shutil.copy2(dst, dst.with_suffix(dst.suffix + f".bak-{stamp}"))
         shutil.copy2(src, dst)
