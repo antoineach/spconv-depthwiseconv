@@ -112,6 +112,18 @@ def main():
         raise SystemExit(f"unexpected unpack layout: {pkg_dirs}")
     pkg_dir = pkg_dirs[0]
 
+    # sanity: the base wheel must be a real PREBUILT (ships the compiled
+    # backend `spconv/core_cc`). A `py3-none-any` source wheel JIT-compiles
+    # core_cc at runtime and is useless on a machine without a toolchain.
+    core_cc = list((pkg_dir / "spconv").glob("core_cc*"))
+    if not core_cc:
+        print("WARNING: base wheel has no 'spconv/core_cc' compiled backend.\n"
+              "         This looks like a source/py3-none-any wheel: the result"
+              " will\n         NOT work on a machine without CUDA+ninja (spconv"
+              " itself will\n         fail to import). Use a real prebuilt wheel"
+              " instead, e.g.\n         pip download --only-binary=:all: "
+              "--no-deps spconv-cu120==2.3.8\n", file=sys.stderr)
+
     # 3) overlay our patched files
     print("[3/4] injecting depthwise files")
     for rel in FILES:
